@@ -1,0 +1,17 @@
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: cloudmemo-ingress
+  namespace: team-blue
+spec:
+  rules:
+  - host: blue.<VOTRE_PRENOM>.tp.kaas-mvp-ts.fr
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: cloudmemo
+            port:
+              number: 5000
