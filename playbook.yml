@@ -1,0 +1,190 @@
+---
+# ===================================================================
+# 1. CONFIGURATION DE TOUS LES NOEUDS (Master & Workers)
+# ===================================================================
+- hosts: all
+  become: yes
+  tasks:
+
+    # --- Désactivation du Swap (Requis par K8s) ---
+    - name: Desactiver le swap immediatement
+      command: swapoff -a
+      when: ansible_swaptotal_mb > 0
+
+    - name: Desactiver le swap au redemarrage
+      replace:
+        path: /etc/fstab
+        regexp: '(^.*\sswap\s.*$)'
+        replace: '# \1'
+
+    # --- Installation des dependances systeme ---
+    - name: Installer les paquets de base
+      apt:
+        name:
+          - apt-transport-https
+          - ca-certificates
+          - curl
+          - gnupg
+          - lsb-release
+        state: present
+        update_cache: yes
+
+    # --- Configuration Reseau Kernel ---
+    - name: Configurer les modules kernel pour K8s
+      copy:
+        dest: /etc/modules-load.d/k8s.conf
+        content: |
+          overlay
+          br_netfilter
+
+    - name: Charger les modules kernel
+      shell: |
+        modprobe overlay
+        modprobe br_netfilter
+
+    - name: Parametrer sysctl pour le reseau
+      copy:
+        dest: /etc/sysctl.d/k8s.conf
+        content: |
+          net.bridge.bridge-nf-call-iptables = 1
+          net.bridge.bridge-nf-call-ip6tables = 1
+          net.ipv4.ip_forward = 1
+
+    - name: Appliquer les parametres sysctl
+      command: sysctl --system
+
+    # --- Installation et Config de Containerd ---
+    - name: Installer le runtime containerd
+      apt:
+        name: containerd
+        state: present
+
+    - name: Creer le repertoire de config containerd
+      file:
+        path: /etc/containerd
+        state: directory
+
+    - name: Generer et corriger la config pour SystemdCgroup
+      shell: |
+        containerd config default | sed 's/SystemdCgroup = false/SystemdCgroup = true/' > /etc/containerd/config.toml
+      changed_when: true
+
+    - name: Redemarrer containerd
+      service:
+        name: containerd
+        state: restarted
+        enabled: yes
+
+# --- Installation des binaires Kubernetes (v1.34) ---
+    - name: Creer le repertoire des cles APT
+      file:
+        path: /etc/apt/keyrings
+        state: directory
+        mode: '0755'
+
+    - name: Telecharger la cle GPG Kubernetes (v1.34)
+      get_url:
+        url: https://pkgs.k8s.io/core:/stable:/v1.34/deb/Release.key
+        dest: /etc/apt/keyrings/kubernetes-apt-keyring.key
+        mode: '0644'
+
+    - name: Convertir la cle en format GPG
+      command: gpg --dearmor -o /etc/apt/keyrings/kubernetes-apt-keyring.gpg /etc/apt/keyrings/kubernetes-apt-keyring.key
+      args:
+        creates: /etc/apt/keyrings/kubernetes-apt-keyring.gpg
+
+    - name: Ajouter le depot Kubernetes v1.34
+      copy:
+        dest: /etc/apt/sources.list.d/kubernetes.list
+        content: "deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/v1.34/deb/ /"
+
+    - name: Installer kubelet, kubeadm et kubectl (v1.34)
+      apt:
+        name: 
+          - kubelet
+          - kubeadm
+          - kubectl
+        state: present
+        update_cache: yes
+
+    - name: Bloquer la version des paquets
+      command: apt-mark hold kubelet kubeadm kubectl
+
+# ===================================================================
+# 2. INITIALISATION DU MASTER
+# ===================================================================
+- hosts: masters
+  become: yes
+  vars:
+    kube_user: k8s
+  tasks:
+
+    - name: Creer l'utilisateur d'administration
+      user:
+        name: "{{ kube_user }}"
+        shell: /bin/bash
+        create_home: yes
+
+    - name: Initialiser le cluster (kubeadm init)
+      command: kubeadm init --pod-network-cidr=192.168.0.0/16
+      args:
+        creates: /etc/kubernetes/admin.conf
+
+    - name: Configurer le dossier .kube pour l'utilisateur
+      file:
+        path: "/home/{{ kube_user }}/.kube"
+        state: directory
+        owner: "{{ kube_user }}"
+        group: "{{ kube_user }}"
+
+    - name: Copier la config admin pour kubectl
+      copy:
+        src: /etc/kubernetes/admin.conf
+        dest: "/home/{{ kube_user }}/.kube/config"
+        remote_src: yes
+        owner: "{{ kube_user }}"
+        group: "{{ kube_user }}"
+        mode: '0600'
+
+    - name: Attendre que l'API Server soit pret
+      shell: kubectl get nodes
+      environment:
+        KUBECONFIG: "/home/{{ kube_user }}/.kube/config"
+      register: api_ready
+      retries: 15
+      delay: 10
+      until: api_ready.rc == 0
+
+    - name: Installer le plugin reseau Calico
+      shell: kubectl apply -f https://raw.githubusercontent.com/projectcalico/calico/v3.27.2/manifests/calico.yaml
+      environment:
+        KUBECONFIG: "/home/{{ kube_user }}/.kube/config"
+      retries: 5
+      delay: 15
+      register: calico_result
+      until: calico_result.rc == 0
+
+    - name: Generer le token de join pour les workers
+      command: kubeadm token create --print-join-command
+      register: join_cmd_raw
+
+    - name: Enregistrer la commande de join
+      set_fact:
+        join_command: "{{ join_cmd_raw.stdout }}"
+
+
+# ===================================================================
+# 3. JOIN DES WORKERS
+# ===================================================================
+- hosts: workers
+  become: yes
+  tasks:
+
+    - name: Recuperer la commande de join du master
+      set_fact:
+        join_command: "{{ hostvars[groups['masters'][0]].join_command }}"
+
+    - name: Rejoindre le cluster Kubernetes
+      command: "{{ join_command }}"
+      args:
+        creates: /etc/kubernetes/kubelet.conf
